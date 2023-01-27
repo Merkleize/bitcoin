@@ -21,6 +21,7 @@
 #include <policy/feerate.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
+#include <script/interpreter.h>
 #include <script/script_error.h>
 #include <script/sigcache.h>
 #include <sync.h>
@@ -345,8 +346,10 @@ private:
     SignatureCache* m_signature_cache;
 
 public:
+    std::vector<DeferredCheck> m_deferred_checks;
+
     CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, SignatureCache& signature_cache, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache) { }
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), m_signature_cache(&signature_cache), m_deferred_checks() { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;
@@ -950,7 +953,7 @@ private:
     }
 
     //! A queue for script verifications that have to be performed by worker threads.
-    CCheckQueue<CScriptCheck> m_script_check_queue;
+    CCheckQueue<CScriptCheck, DeferredCheck> m_script_check_queue;
 
     //! Timers and counters used for benchmarking validation in both background
     //! and active chainstates.
@@ -1318,7 +1321,7 @@ public:
     //! nullopt.
     std::optional<int> GetSnapshotBaseHeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    CCheckQueue<CScriptCheck>& GetCheckQueue() { return m_script_check_queue; }
+    CCheckQueue<CScriptCheck, DeferredCheck>& GetCheckQueue() { return m_script_check_queue; }
 
     ~ChainstateManager();
 };

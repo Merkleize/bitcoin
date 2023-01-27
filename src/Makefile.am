@@ -668,7 +668,9 @@ libbitcoin_consensus_a_SOURCES = \
   span.h \
   tinyformat.h \
   uint256.cpp \
-  uint256.h
+  uint256.h \
+  util/check.cpp \
+  util/check.h
 #
 
 # common #

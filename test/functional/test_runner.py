@@ -388,6 +388,7 @@ BASE_SCRIPTS = [
     'p2p_node_network_limited.py --v2transport',
     'p2p_permissions.py',
     'feature_blocksdir.py',
+    'feature_checkcontractverify.py',
     'wallet_startup.py',
     'feature_remove_pruned_files_on_startup.py',
     'p2p_i2p_ports.py',

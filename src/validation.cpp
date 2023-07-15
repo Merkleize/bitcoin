@@ -2175,7 +2175,42 @@ static std::optional<DeferredCheckError> ValidateDeferredChecks(
     const std::vector<DeferredCheck>& checks,
     const CTransaction& tx)
 {
-    // Perform deferred checks here.
+    std::unordered_map<size_t, CAmount> expected_output_amount;
+
+    // outputs that cannot be used with CCV_FLAG_DEDUCT_OUTPUT_AMOUNT, because they were
+    // used with another OP_CHECKCONTRACTVERIFY opcode that had an amount check.
+    std::unordered_set<size_t> excluded_outputs;
+
+    for (const auto& c : checks) {
+        if (const auto& amount_check = c.m_aggr_output_amount_check) {
+            expected_output_amount[amount_check->vout_idx] += amount_check->amount;
+
+            // make sure that this output cannot also be used with CCV_FLAG_DEDUCT_OUTPUT_AMOUNT
+            excluded_outputs.insert(amount_check->vout_idx);
+        }
+    }
+
+    // Ensure that all inputs with a deferred check on an output have their value
+    // reflected in it.
+    for (const auto& [vout_idx, amount] : expected_output_amount) {
+        if (tx.vout[vout_idx].nValue < amount) {
+            return DeferredCheckError{"ccv-insufficient-output-value"};
+        }
+    }
+
+    // This check must be done after other checks on the output amount for OP_CHECKCONTRACTVERIFY
+    for (const auto& c : checks) {
+        if (const auto& excl_check = c.m_excl_output_amount_check) {
+            if (excluded_outputs.find(excl_check->vout_idx) != excluded_outputs.end()) {
+                return DeferredCheckError{"ccv-conflicting-output-amount-checks"};
+            }
+
+            // make sure that it is not used again with CCV_FLAG_DEDUCT_OUTPUT_AMOUNT
+            excluded_outputs.insert(excl_check->vout_idx);
+        }
+    }
+
+    // Perform more deferred checks here.
     return std::nullopt;
 }
 

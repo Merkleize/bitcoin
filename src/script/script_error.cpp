@@ -27,6 +27,14 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Script failed an OP_NUMEQUALVERIFY operation";
         case SCRIPT_ERR_TEMPLATE_MISMATCH:
             return "Script failed an OP_CHECKTEMPLATEVERIFY operation";
+        case SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS:
+            return "Invalid arguments for OP_CHECKCONTRACTVERIFY";
+        case SCRIPT_ERR_CHECKCONTRACTVERIFY_OUT_OF_BOUNDS:
+            return "Index of input/output out of bounds in OP_CHECKCONTRACTVERIFY";
+        case SCRIPT_ERR_CHECKCONTRACTVERIFY_MISMATCH:
+            return "Mismatching contract data or program";
+        case SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT:
+            return "Incorrect amount for OP_CHECKCONTRACTVERIFY";
         case SCRIPT_ERR_SCRIPT_SIZE:
             return "Script is too big";
         case SCRIPT_ERR_PUSH_SIZE:
@@ -119,6 +127,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Using OP_CODESEPARATOR in non-witness script";
         case SCRIPT_ERR_SIG_FINDANDDELETE:
             return "Signature is found in scriptCode";
+        case SCRIPT_ERR_INTROSPECT_CONTEXT_UNAVAILABLE:
+            return "Introspection opcode used without correct evaluation context";
         case SCRIPT_ERR_UNKNOWN_ERROR:
         case SCRIPT_ERR_ERROR_COUNT:
         default: break;

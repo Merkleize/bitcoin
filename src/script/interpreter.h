@@ -268,6 +268,16 @@ struct ScriptExecutionData
 
     //! The taproot internal key. */
     std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+
+    //! Whether m_taproot_merkle_root is initialized.
+    bool m_taproot_merkle_root_init = false;
+    //! The merkle root of the taproot tree.
+    uint256 m_taproot_merkle_root;
+
+    //! Whether m_ccv_amount is initialized.
+    bool m_ccv_amount_init = false;
+    //! Residual amount of the current input according to CHECKCONTRACTVERIFY semantics.
+    CAmount m_ccv_amount;
 };
 
 /** Signature hash sizes */
@@ -319,6 +329,11 @@ public:
         return false;
     }
 
+    virtual bool CheckContract(int flags, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -356,6 +371,7 @@ public:
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
+    bool CheckContract(int flags, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;

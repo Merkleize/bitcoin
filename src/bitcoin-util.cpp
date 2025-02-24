@@ -369,7 +369,9 @@ static int EvalScript(const ArgsManager& argsman, const std::vector<std::string>
         opsuccess_check = CheckTapscriptOpSuccess(script, flags, &serror);
     }
 
-    bool success = (opsuccess_check.has_value() ? *opsuccess_check : EvalScript(stack, script, flags, *Assert(checker), sigversion, execdata, &serror));
+    TransactionExecutionData tx_exec_data(txTo->vout.size());
+
+    bool success = (opsuccess_check.has_value() ? *opsuccess_check : EvalScript(stack, script, flags, *Assert(checker), sigversion, execdata, &serror, &tx_exec_data));
     if (opsuccess_check.has_value()) {
          result.pushKV("opsuccess_found", true);
     } else if (success) {

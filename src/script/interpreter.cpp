@@ -431,7 +431,7 @@ const int CCV_FLAG_IGNORE_OUTPUT_AMOUNT = 1;
 //! Flag to specify that an OP_CHECKCONTRACVERIFY referring to an output deducts the amount of its output from the current input amount for future calls.
 const int CCV_FLAG_DEDUCT_OUTPUT_AMOUNT = 2;
 
-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror)
+bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror, TransactionExecutionData* tx_exec_data)
 {
     static const CScriptNum bnZero(0);
     static const CScriptNum bnOne(1);
@@ -1216,7 +1216,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                         return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS);
                     }
 
-                    if (!checker.CheckContract(flags, index, pk, data, taptree, execdata, serror)) {
+                    if (!checker.CheckContract(flags, index, pk, data, taptree, execdata, serror, tx_exec_data)) {
                         return false; // serror is set
                     }
 
@@ -1360,10 +1360,10 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     return set_success(serror);
 }
 
-bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror)
+bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, TransactionExecutionData* tx_exec_data)
 {
     ScriptExecutionData execdata;
-    return EvalScript(stack, script, flags, checker, sigversion, execdata, serror);
+    return EvalScript(stack, script, flags, checker, sigversion, execdata, serror, tx_exec_data);
 }
 
 namespace {
@@ -2024,7 +2024,7 @@ bool GenericTransactionSignatureChecker<T>::CheckDefaultCheckTemplateVerifyHash(
 }
 
 template <class T>
-bool GenericTransactionSignatureChecker<T>::CheckContract(int flags, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror) const
+bool GenericTransactionSignatureChecker<T>::CheckContract(int flags, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror, TransactionExecutionData* tx_exec_data) const
 {
     assert(ScriptExecutionData.m_internal_key.has_value());
 
@@ -2083,25 +2083,40 @@ bool GenericTransactionSignatureChecker<T>::CheckContract(int flags, int index, 
         ScriptExecutionData.m_ccv_amount_init = true;
     }
 
-    switch (flags) {
-        case 0:
-            // TODO: amount logic
-            break;
-        case CCV_FLAG_IGNORE_OUTPUT_AMOUNT:
-            // amount checking is disabled
-            break;
-        case CCV_FLAG_DEDUCT_OUTPUT_AMOUNT:
-            // subtract amount from input
-            if (txTo->vout[index].nValue > ScriptExecutionData.m_ccv_amount) {
-                return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
-            }
-            ScriptExecutionData.m_ccv_amount -= txTo->vout[index].nValue;
+    if (tx_exec_data != nullptr) {
+        std::lock_guard<std::mutex> lock(tx_exec_data->m_mutex);
 
-            // TODO: amount logic
+        switch (flags) {
+            case 0:
+                if (tx_exec_data->m_ccv_output_checked_deduct[index]) {
+                    return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
+                }
+                tx_exec_data->m_ccv_output_checked_default[index] = true;
 
-            break;
-        default:
-            break;
+                tx_exec_data->m_ccv_output_min_amount[index] += ScriptExecutionData.m_ccv_amount;
+                ScriptExecutionData.m_ccv_amount = 0;
+                if (txTo->vout[index].nValue < tx_exec_data->m_ccv_output_min_amount[index]) {
+                    return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
+                }
+                break;
+            case CCV_FLAG_IGNORE_OUTPUT_AMOUNT:
+                // amount checking is disabled
+                break;
+            case CCV_FLAG_DEDUCT_OUTPUT_AMOUNT:
+                if (tx_exec_data->m_ccv_output_checked_default[index] || tx_exec_data->m_ccv_output_checked_deduct[index]) {
+                    return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
+                }
+                tx_exec_data->m_ccv_output_checked_deduct[index] = true;
+                // subtract amount from input
+                if (txTo->vout[index].nValue > ScriptExecutionData.m_ccv_amount) {
+                    return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
+                }
+                ScriptExecutionData.m_ccv_amount -= txTo->vout[index].nValue;
+
+                break;
+            default:
+                break;
+        }
     }
 
     return true;
@@ -2144,7 +2159,7 @@ std::optional<bool> CheckTapscriptOpSuccess(const CScript& exec_script, unsigned
     return std::nullopt;
 }
 
-static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, ScriptError* serror)
+static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CScript& exec_script, unsigned int flags, SigVersion sigversion, const BaseSignatureChecker& checker, ScriptExecutionData& execdata, TransactionExecutionData* tx_exec_data, ScriptError* serror)
 {
     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};
 
@@ -2163,7 +2178,7 @@ static bool ExecuteWitnessScript(const Span<const valtype>& stack_span, const CS
     }
 
     // Run the script interpreter.
-    if (!EvalScript(stack, exec_script, flags, checker, sigversion, execdata, serror)) return false;
+    if (!EvalScript(stack, exec_script, flags, checker, sigversion, execdata, serror, tx_exec_data)) return false;
 
     // Scripts inside witness implicitly require cleanstack behaviour
     if (stack.size() != 1) return set_error(serror, SCRIPT_ERR_CLEANSTACK);
@@ -2217,7 +2232,7 @@ static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, c
     return q.CheckTapTweak(p, merkle_root, control[0] & 1);
 }
 
-static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh)
+static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh, TransactionExecutionData* tx_exec_data = nullptr)
 {
     CScript exec_script; //!< Actually executed script (last stack item in P2WSH; implied P2PKH script in P2WPKH; leaf script in P2TR)
     Span stack{witness.stack};
@@ -2236,14 +2251,14 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if (memcmp(hash_exec_script.begin(), program.data(), 32)) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
             }
-            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, serror);
+            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, tx_exec_data, serror);
         } else if (program.size() == WITNESS_V0_KEYHASH_SIZE) {
             // BIP141 P2WPKH: 20-byte witness v0 program (which encodes Hash160(pubkey))
             if (stack.size() != 2) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH); // 2 items in witness
             }
             exec_script << OP_DUP << OP_HASH160 << program << OP_EQUALVERIFY << OP_CHECKSIG;
-            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, serror);
+            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, tx_exec_data, serror);
         } else {
             return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH);
         }
@@ -2284,7 +2299,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 exec_script = CScript(script.begin(), script.end());
                 execdata.m_validation_weight_left = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
                 execdata.m_validation_weight_left_init = true;
-                return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::TAPSCRIPT, checker, execdata, serror);
+                return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::TAPSCRIPT, checker, execdata, tx_exec_data, serror);
             }
             if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
                 return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
@@ -2303,7 +2318,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
 }
 
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror)
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, TransactionExecutionData* tx_exec_data)
 {
     static const CScriptWitness emptyWitness;
     if (witness == nullptr) {
@@ -2343,7 +2358,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                 // The scriptSig must be _exactly_ CScript(), otherwise we reintroduce malleability.
                 return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED);
             }
-            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false)) {
+            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false, tx_exec_data)) {
                 return false;
             }
             // Bypass the cleanstack check at the end. The actual stack is obviously not clean
@@ -2388,7 +2403,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                     // reintroduce malleability.
                     return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
                 }
-                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true)) {
+                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true, tx_exec_data)) {
                     return false;
                 }
                 // Bypass the cleanstack check at the end. The actual stack is obviously not clean

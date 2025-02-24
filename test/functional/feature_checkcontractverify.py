@@ -448,7 +448,7 @@ class CheckContractVerifyTest(BitcoinTestFramework):
             # broadcast with insufficient output amount; this should fail
             tx2.vout[0].nValue -= 1
             self.assert_broadcast_tx(
-                tx2, err_msg='ccv-insufficient-output-value')
+                tx2, err_msg='Incorrect amount for OP_CHECKCONTRACTVERIFY')
             tx2.vout[0].nValue += 1
 
         tx2_txid = self.assert_broadcast_tx(tx2, mine_all=True)
@@ -520,7 +520,8 @@ class CheckContractVerifyTest(BitcoinTestFramework):
 
         # broadcast with insufficient output amount; this should fail
         tx4.vout[0].nValue -= 1
-        self.assert_broadcast_tx(tx4, err_msg='ccv-insufficient-output-value')
+        self.assert_broadcast_tx(
+            tx4, err_msg='Incorrect amount for OP_CHECKCONTRACTVERIFY')
         tx4.vout[0].nValue += 1
 
         # correct amount succeeds
@@ -557,7 +558,8 @@ class CheckContractVerifyTest(BitcoinTestFramework):
 
         # broadcast with insufficient output amount; this should fail
         tx2.vout[0].nValue -= 1
-        self.assert_broadcast_tx(tx2, err_msg='ccv-insufficient-output-value')
+        self.assert_broadcast_tx(
+            tx2, err_msg='Incorrect amount for OP_CHECKCONTRACTVERIFY')
         tx2.vout[0].nValue += 1
 
         # broadcast with incorrect output script; this should fail
@@ -608,7 +610,8 @@ class CheckContractVerifyTest(BitcoinTestFramework):
             ]
         )
 
-        self.assert_broadcast_tx(tx2, err_msg='ccv-insufficient-output-value')
+        self.assert_broadcast_tx(
+            tx2, err_msg='Incorrect amount for OP_CHECKCONTRACTVERIFY')
 
         tx2.vout[1].nValue += 1  # correct amount
 

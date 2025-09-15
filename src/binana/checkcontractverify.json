@@ -1,0 +1,9 @@
+{
+    "binana": [2025, 443, 0],
+    "deployment": "CHECKCONTRACTVERIFY",
+    "scriptverify": true,
+    "scriptverify_discourage": true,
+    "opcodes": {
+        "CHECKCONTRACTVERIFY": "0xbb"
+    }
+}

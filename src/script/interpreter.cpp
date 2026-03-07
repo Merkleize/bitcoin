@@ -6,11 +6,14 @@
 #include <script/interpreter.h>
 
 #include <binana.h>
+#include <crypto/hex_base.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <logging.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <streams.h>
 #include <tinyformat.h>
 #include <uint256.h>
 
@@ -39,6 +42,29 @@ inline bool set_error(ScriptError* ret, const ScriptError serror)
     if (ret)
         *ret = serror;
     return false;
+}
+
+inline void LogCheckContractVerifyExecution(
+    const BaseSignatureChecker& checker,
+    const valtype& data_arg,
+    const valtype& index_arg,
+    const valtype& pubkey_arg,
+    const valtype& taptree_arg,
+    const valtype& flags_arg)
+{
+    const auto txid = checker.GetTransactionHash();
+    const auto input_index = checker.GetInputIndex();
+    const auto tx_hex = checker.GetTransactionHex();
+    LogPrintf(
+        "OP_CHECKCONTRACTVERIFY txid=%s input=%s data=%s index=%s pk=%s taptree=%s flags=%s rawtx=%s\n",
+        txid ? txid->ToString() : "unknown",
+        input_index ? strprintf("%u", *input_index) : "unknown",
+        HexStr(data_arg),
+        HexStr(index_arg),
+        HexStr(pubkey_arg),
+        HexStr(taptree_arg),
+        HexStr(flags_arg),
+        tx_hex.value_or(""));
 }
 
 } // namespace
@@ -1237,7 +1263,11 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
 
                     // initially, read only a single parameter at the top of stack
-                    int flags = CScriptNum(stacktop(-1), fRequireMinimal).getint();
+                    const valtype& flags_arg = stacktop(-1);
+                    if (stack.size() >= 5) {
+                        LogCheckContractVerifyExecution(checker, stacktop(-5), stacktop(-4), stacktop(-3), stacktop(-2), flags_arg);
+                    }
+                    int flags = CScriptNum(flags_arg, fRequireMinimal).getint();
                     if (flags < -1 || flags > CCV_MODE_CHECK_OUTPUT_DEDUCT_AMOUNT) {
                         // undefined values of the flags; keep OP_SUCCESS behavior
                         // in order to enable future upgrades via soft-fork
@@ -1251,10 +1281,11 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     if (stack.size() < 5)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
 
-                    valtype& data = stacktop(-5);
-                    int index = CScriptNum(stacktop(-4), fRequireMinimal).getint();
-                    valtype& pk = stacktop(-3);
-                    valtype& taptree = stacktop(-2);
+                    const valtype& data = stacktop(-5);
+                    const valtype& index_arg = stacktop(-4);
+                    int index = CScriptNum(index_arg, fRequireMinimal).getint();
+                    const valtype& pk = stacktop(-3);
+                    const valtype& taptree = stacktop(-2);
 
                     if (!pk.empty() && pk != std::vector<unsigned char>{0x81} && pk.size() != 32) {
                         return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS);
@@ -2050,6 +2081,16 @@ bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(Span<const uns
     }
     if (!VerifySchnorrSignature(sig, pubkey_xonly, sighash)) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG);
     return true;
+}
+
+template <class T>
+std::optional<std::string> GenericTransactionSignatureChecker<T>::GetTransactionHex() const
+{
+    if (!txTo) return std::nullopt;
+
+    DataStream ss_tx;
+    ss_tx << TX_WITH_WITNESS(*txTo);
+    return HexStr(ss_tx);
 }
 
 template <class T>

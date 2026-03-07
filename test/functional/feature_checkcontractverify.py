@@ -12,6 +12,7 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from test_framework import script, key
+from test_framework.authproxy import JSONRPCException
 from test_framework.test_framework import BitcoinTestFramework, TestNode
 from test_framework.p2p import P2PInterface
 from test_framework.wallet import MiniWallet, MiniWalletMode
@@ -22,8 +23,8 @@ from test_framework.script import (
     OP_TRUE,
     TaprootInfo,
 )
-from test_framework.messages import CTransaction, COutPoint, CTxInWitness, CTxOut, CTxIn
-from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.messages import COIN, CTransaction, COutPoint, CTxInWitness, CTxOut, CTxIn
+from test_framework.util import assert_equal
 
 # Modes for OP_CHECKCONTRACTVERIFY
 CCV_MODE_CHECK_INPUT: int = -1
@@ -388,6 +389,74 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         self.test_undefined_modes_opsuccess(node, wallet)
         self.test_invalid_parameters(node, wallet)
 
+    def log_broadcast_result(
+        self,
+        txid: str,
+        success: bool,
+        txhex: str,
+        prevouts: List[Tuple[int, str]],
+        error: Optional[str] = None,
+    ) -> None:
+        log_msg = (
+            f"Broadcast txid={txid} success={success} "
+            f"prevouts={self.format_prevouts(prevouts)} rawtx={txhex}"
+        )
+        if error is not None:
+            log_msg += f' error="{error}"'
+        self.log.info(log_msg)
+
+    def format_prevouts(self, prevouts: List[Tuple[int, str]]) -> str:
+        return "[" + ", ".join(
+            f'({amount}, "{script_pubkey}")' for amount, script_pubkey in prevouts
+        ) + "]"
+
+    def get_prevouts(self, node: TestNode, tx: CTransaction) -> List[Tuple[int, str]]:
+        prevouts = []
+        for txin in tx.vin:
+            txid = f"{txin.prevout.hash:064x}"
+            txout = node.gettxout(txid=txid, n=txin.prevout.n, include_mempool=True)
+            assert txout is not None
+            prevouts.append((
+                int(txout["value"] * COIN),
+                txout["scriptPubKey"]["hex"],
+            ))
+        return prevouts
+
+    def send_to_and_log(
+        self,
+        node: TestNode,
+        wallet: MiniWallet,
+        *,
+        scriptPubKey: bytes,
+        amount: int,
+        fee: int = 1000,
+    ) -> Dict[str, Any]:
+        # Mirror MiniWallet.send_to so the txid is available for logging on rejection.
+        tx = wallet.create_self_transfer(fee_rate=0)["tx"]
+        assert tx.vout[0].nValue >= amount + fee
+        tx.vout[0].nValue -= (amount + fee)
+        tx.vout.append(CTxOut(amount, scriptPubKey))
+
+        txhex = tx.serialize().hex()
+        txid = tx.rehash()
+        prevouts = self.get_prevouts(node, tx)
+
+        try:
+            assert_equal(wallet.sendrawtransaction(from_node=node, tx_hex=txhex), txid)
+        except JSONRPCException as e:
+            self.log_broadcast_result(
+                txid, success=False, txhex=txhex, prevouts=prevouts, error=e.error["message"])
+            raise
+
+        self.log_broadcast_result(txid, success=True, txhex=txhex, prevouts=prevouts)
+        return {
+            "sent_vout": 1,
+            "txid": txid,
+            "wtxid": tx.getwtxid(),
+            "hex": txhex,
+            "tx": tx,
+        }
+
     def test_ccv(
         self,
         node: TestNode,
@@ -413,8 +482,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         amount_sats = 100_000
         fees = 1_000 if ignore_amount else 0
 
-        res = wallet.send_to(
-            from_node=node,
+        res = self.send_to_and_log(
+            node=node,
+            wallet=wallet,
             scriptPubKey=S.get_tr_info().scriptPubKey,
             amount=amount_sats
         )
@@ -489,8 +559,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
             amount_sats = 100_000 * (i + 1)
             amounts_sats.append(amount_sats)
 
-            res = wallet.send_to(
-                from_node=node,
+            res = self.send_to_and_log(
+                node=node,
+                wallet=wallet,
                 scriptPubKey=S.get_tr_info().scriptPubKey,
                 amount=amount_sats
             )
@@ -527,8 +598,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
 
         C = SendToSelf()
 
-        res = wallet.send_to(
-            from_node=node,
+        res = self.send_to_and_log(
+            node=node,
+            wallet=wallet,
             scriptPubKey=C.get_tr_info().scriptPubKey,
             amount=amount_sats
         )
@@ -575,8 +647,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         amount_sats = 10_000
         recover_amount_sats = 3_000  # the amount that goes back to the same script
 
-        res = wallet.send_to(
-            from_node=node,
+        res = self.send_to_and_log(
+            node=node,
+            wallet=wallet,
             scriptPubKey=S.get_tr_info().scriptPubKey,
             amount=amount_sats
         )
@@ -622,8 +695,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         for testcase in testcases:
             C = TestCCVSuccess(**testcase)
 
-            res = wallet.send_to(
-                from_node=node,
+            res = self.send_to_and_log(
+                node=node,
+                wallet=wallet,
                 scriptPubKey=C.get_tr_info().scriptPubKey,
                 amount=amount_sats
             )
@@ -669,8 +743,9 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         for testcase in testcases:
             C = TestCCVFail(**testcase)
 
-            res = wallet.send_to(
-                from_node=node,
+            res = self.send_to_and_log(
+                node=node,
+                wallet=wallet,
                 scriptPubKey=C.get_tr_info().scriptPubKey,
                 amount=amount_sats
             )
@@ -705,12 +780,35 @@ class CheckContractVerifyTest(BitcoinTestFramework):
         node = self.nodes[0]
         txhex = tx.serialize().hex()
         txid = tx.rehash()
+        prevouts = self.get_prevouts(node, tx)
 
         if not err_msg:
-            assert_equal(node.sendrawtransaction(txhex), txid)
+            try:
+                assert_equal(node.sendrawtransaction(txhex), txid)
+            except JSONRPCException as e:
+                self.log_broadcast_result(
+                    txid, success=False, txhex=txhex, prevouts=prevouts, error=e.error["message"])
+                raise
+
+            self.log_broadcast_result(txid, success=True, txhex=txhex, prevouts=prevouts)
         else:
-            assert_raises_rpc_error(-26, err_msg,
-                                    node.sendrawtransaction, txhex)
+            try:
+                node.sendrawtransaction(txhex)
+            except JSONRPCException as e:
+                error = e.error
+                self.log_broadcast_result(
+                    txid, success=False, txhex=txhex, prevouts=prevouts, error=error["message"])
+                assert_equal(error["code"], -26)
+                if err_msg not in error["message"]:
+                    raise AssertionError(
+                        f"Expected error containing '{err_msg}', got '{error['message']}'"
+                    ) from e
+            else:
+                self.log_broadcast_result(txid, success=True, txhex=txhex, prevouts=prevouts)
+                raise AssertionError(
+                    f"Broadcast unexpectedly succeeded for txid={txid}; "
+                    f"expected error containing '{err_msg}'"
+                )
 
         if mine_all:
             self.generate(node, 1)

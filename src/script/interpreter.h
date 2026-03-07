@@ -405,6 +405,21 @@ public:
         return false;
     }
 
+    virtual std::optional<uint256> GetTransactionHash() const
+    {
+        return std::nullopt;
+    }
+
+    virtual std::optional<unsigned int> GetInputIndex() const
+    {
+        return std::nullopt;
+    }
+
+    virtual std::optional<std::string> GetTransactionHex() const
+    {
+        return std::nullopt;
+    }
+
     virtual bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& execdata, ScriptError* serror, TransactionExecutionData* tx_exec_data) const
     {
         return false;
@@ -448,6 +463,9 @@ public:
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
+    std::optional<uint256> GetTransactionHash() const override { return txTo ? std::optional<uint256>{txTo->GetHash()} : std::nullopt; }
+    std::optional<unsigned int> GetInputIndex() const override { return nIn; }
+    std::optional<std::string> GetTransactionHex() const override;
     bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror, TransactionExecutionData* tx_exec_data) const override;
 };
 
@@ -479,6 +497,21 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override
     {
         return m_checker.CheckSequence(nSequence);
+    }
+
+    std::optional<uint256> GetTransactionHash() const override
+    {
+        return m_checker.GetTransactionHash();
+    }
+
+    std::optional<unsigned int> GetInputIndex() const override
+    {
+        return m_checker.GetInputIndex();
+    }
+
+    std::optional<std::string> GetTransactionHex() const override
+    {
+        return m_checker.GetTransactionHex();
     }
 };
 

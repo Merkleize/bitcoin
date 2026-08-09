@@ -16,6 +16,15 @@
 
 typedef std::vector<unsigned char> valtype;
 
+//! Flag to mark an OP_CHECKCONTRACVERIFY as referring to an input.
+const int CCV_MODE_CHECK_INPUT = -1;
+//! Flag to specify that an OP_CHECKCONTRACVERIFY which refers to an output, with the default amount logic.
+const int CCV_MODE_CHECK_OUTPUT = 0;
+//! Flag to specify that an OP_CHECKCONTRACVERIFY which refers to an output does not check the output amount.
+const int CCV_MODE_CHECK_OUTPUT_IGNORE_AMOUNT = 1;
+//! Flag to specify that an OP_CHECKCONTRACVERIFY referring to an output deducts the amount of its output from the current input amount for future calls.
+const int CCV_MODE_CHECK_OUTPUT_DEDUCT_AMOUNT = 2;
+
 namespace {
 
 inline bool set_success(ScriptError* ret)
@@ -1218,6 +1227,51 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
+                case OP_CHECKCONTRACTVERIFY:
+                {
+                    // OP_CHECKCONTRACTVERIFY is only available in Tapscript
+                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    // we expect at least the flag to be on the stack
+                    if (stack.empty())
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    // initially, read only a single parameter at the top of stack
+                    int flags = CScriptNum(stacktop(-1), fRequireMinimal).getint();
+                    if (flags < -1 || flags > CCV_MODE_CHECK_OUTPUT_DEDUCT_AMOUNT) {
+                        // undefined values of the flags; keep OP_SUCCESS behavior
+                        // in order to enable future upgrades via soft-fork
+                        stack = { {1} };
+                        return set_success(serror);
+                    }
+
+                    // all currently defined versions require exactly 5 stack elements
+
+                    // (data index pk taptree flags -- )
+                    if (stack.size() < 5)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    valtype& data = stacktop(-5);
+                    int index = CScriptNum(stacktop(-4), fRequireMinimal).getint();
+                    valtype& pk = stacktop(-3);
+                    valtype& taptree = stacktop(-2);
+
+                    if (!pk.empty() && pk != std::vector<unsigned char>{0x81} && pk.size() != 32) {
+                        return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS);
+                    }
+
+                    if (!checker.CheckContract(flags, index, pk, data, taptree, execdata, serror)) {
+                        return false; // serror is set
+                    }
+
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                }
+                break;
+
                 case OP_CHECKMULTISIG:
                 case OP_CHECKMULTISIGVERIFY:
                 {
@@ -2135,6 +2189,145 @@ uint256 GenericTransactionSignatureChecker<T>::GetTemplateHash(ScriptExecutionDa
     return ss.GetSHA256();
 }
 
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& execdata, ScriptError* serror) const
+{
+    assert(execdata.m_internal_key.has_value());
+    assert(execdata.m_taproot_merkle_root.has_value());
+
+    if (txdata == nullptr || execdata.m_ccv_data == nullptr ||
+        !(txdata->m_bip341_taproot_ready && txdata->m_spent_outputs_ready)) {
+        return HandleMissingData(m_mdb);
+    }
+
+    bool use_current_taptree = taptree.size() == 1 && taptree.data()[0] == 0x81;
+    bool use_current_pubkey = pubkey.size() == 1 && pubkey.data()[0] == 0x81;
+
+    uint256 merkle_tree;
+    const uint256 *merkle_tree_ptr = nullptr;
+    if (taptree.empty()) {
+        // no taptweak, leave nullptr
+    } else if (use_current_taptree) {
+        merkle_tree_ptr = &execdata.m_taproot_merkle_root.value();
+    } else if (taptree.size() == 32) {
+        merkle_tree = uint256(taptree);
+        merkle_tree_ptr = &merkle_tree;
+    } else {
+        return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS);
+    }
+
+    XOnlyPubKey initialXOnlyKey;
+    if (use_current_pubkey) {
+        initialXOnlyKey = execdata.m_internal_key.value();
+    } else if (pubkey.empty()) {
+        initialXOnlyKey = XOnlyPubKey::NUMS_H;
+    } else {
+        initialXOnlyKey = XOnlyPubKey{Span<const unsigned char>{pubkey.data(), pubkey.data() + 32}};
+    }
+
+    if (index == -1) {
+        index = nIn;
+    }
+
+    auto indexLimit = (mode == CCV_MODE_CHECK_INPUT ? txTo->vin.size() : txTo->vout.size());
+    if (index < 0 || index >= static_cast<int>(indexLimit)) {
+        return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_OUT_OF_BOUNDS);
+    }
+
+    CScript scriptPubKey = (mode == CCV_MODE_CHECK_INPUT) ? txdata->m_spent_outputs[index].scriptPubKey : txTo->vout.at(index).scriptPubKey;
+
+    if (scriptPubKey.size() != 1 + 1 + 32 || scriptPubKey[0] != OP_1 || scriptPubKey[1] != 32) {
+        return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_ARGS);
+    }
+
+    const XOnlyPubKey finalXOnlyKey{Span<const unsigned char>{scriptPubKey.data() + 2, scriptPubKey.data() + 34}};
+
+    if (!finalXOnlyKey.CheckDoubleTweak(initialXOnlyKey, data, merkle_tree_ptr)) {
+        return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_MISMATCH);
+    }
+
+
+    if (!execdata.m_ccv_amount_init) {
+        execdata.m_ccv_amount = amount;
+        execdata.m_ccv_amount_init = true;
+    }
+
+    switch (mode) {
+        case CCV_MODE_CHECK_OUTPUT:
+            execdata.m_ccv_data->m_constraints.push_back(
+                CcvAmountConstraint::Aggregate(index, execdata.m_ccv_amount));
+            execdata.m_ccv_amount = 0;
+            break;
+        case CCV_MODE_CHECK_OUTPUT_IGNORE_AMOUNT:
+            // amount checking is disabled
+            break;
+        case CCV_MODE_CHECK_OUTPUT_DEDUCT_AMOUNT:
+            // Subtract the output amount from this input's residual amount. Conflicts
+            // with constraints produced by other inputs are checked after all scripts.
+            if (txTo->vout[index].nValue > execdata.m_ccv_amount) {
+                return set_error(serror, SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT);
+            }
+            execdata.m_ccv_amount -= txTo->vout[index].nValue;
+            execdata.m_ccv_data->m_constraints.push_back(
+                CcvAmountConstraint::Exclusive(index));
+            break;
+        default:
+            break;
+    }
+
+    return true;
+}
+
+std::optional<ScriptError> ValidateCcvTransaction(const CTransaction& tx, const CcvTransactionExecutionData& ccv_data)
+{
+    enum class OutputConstraintType {
+        NONE,
+        AGGREGATE,
+        EXCLUSIVE,
+    };
+    struct OutputState {
+        CAmount m_min_amount{0};
+        OutputConstraintType m_type{OutputConstraintType::NONE};
+    };
+
+    if (ccv_data.m_inputs.size() != tx.vin.size()) {
+        return SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT;
+    }
+
+    std::vector<OutputState> output_states(tx.vout.size());
+    for (const auto& input_data : ccv_data.m_inputs) {
+        for (const auto& constraint : input_data.m_constraints) {
+            if (constraint.m_output_index >= tx.vout.size()) {
+                return SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT;
+            }
+            OutputState& output_state = output_states[constraint.m_output_index];
+
+            switch (constraint.m_type) {
+            case CcvAmountConstraint::Type::AGGREGATE:
+                if (output_state.m_type == OutputConstraintType::EXCLUSIVE ||
+                    !MoneyRange(constraint.m_amount) ||
+                    constraint.m_amount > MAX_MONEY - output_state.m_min_amount) {
+                    return SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT;
+                }
+                output_state.m_type = OutputConstraintType::AGGREGATE;
+                output_state.m_min_amount += constraint.m_amount;
+                if (tx.vout[constraint.m_output_index].nValue < output_state.m_min_amount) {
+                    return SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT;
+                }
+                break;
+            case CcvAmountConstraint::Type::EXCLUSIVE:
+                if (output_state.m_type != OutputConstraintType::NONE) {
+                    return SCRIPT_ERR_CHECKCONTRACTVERIFY_WRONG_AMOUNT;
+                }
+                output_state.m_type = OutputConstraintType::EXCLUSIVE;
+                break;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
 // explicit instantiation
 template class GenericTransactionSignatureChecker<CTransaction>;
 template class GenericTransactionSignatureChecker<CMutableTransaction>;
@@ -2236,7 +2429,7 @@ uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint25
     return k;
 }
 
-static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash, std::optional<XOnlyPubKey>& internal_key)
+static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash, std::optional<XOnlyPubKey>& internal_key, std::optional<uint256>& merkle_root)
 {
     assert(control.size() >= TAPROOT_CONTROL_BASE_SIZE);
     assert(program.size() >= uint256::size());
@@ -2246,16 +2439,17 @@ static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, c
     //! The output pubkey (taken from the scriptPubKey).
     const XOnlyPubKey q{program};
     // Compute the Merkle root from the leaf and the provided path.
-    const uint256 merkle_root = ComputeTaprootMerkleRoot(control, tapleaf_hash);
+    merkle_root = ComputeTaprootMerkleRoot(control, tapleaf_hash);
     // Verify that the output pubkey matches the tweaked internal pubkey, after correcting for parity.
-    return q.CheckTapTweak(p, merkle_root, control[0] & 1);
+    return q.CheckTapTweak(p, merkle_root.value(), control[0] & 1);
 }
 
-static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh)
+static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, const std::vector<unsigned char>& program, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, bool is_p2sh, CcvInputExecutionData* ccv_data = nullptr)
 {
     CScript exec_script; //!< Actually executed script (last stack item in P2WSH; implied P2PKH script in P2WPKH; leaf script in P2TR)
     Span stack{witness.stack};
     ScriptExecutionData execdata;
+    execdata.m_ccv_data = ccv_data;
 
     if (witversion == 0) {
         if (program.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
@@ -2308,7 +2502,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
                 return set_error(serror, SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE);
             }
             execdata.m_tapleaf_hash = ComputeTapleafHash(control[0] & TAPROOT_LEAF_MASK, script);
-            if (!VerifyTaprootCommitment(control, program, execdata.m_tapleaf_hash, execdata.m_internal_key)) {
+            if (!VerifyTaprootCommitment(control, program, execdata.m_tapleaf_hash, execdata.m_internal_key, execdata.m_taproot_merkle_root)) {
                 return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
             }
             execdata.m_tapleaf_hash_init = true;
@@ -2336,7 +2530,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
     // There is intentionally no return statement here, to be able to use "control reaches end of non-void function" warnings to detect gaps in the logic above.
 }
 
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror)
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror, CcvInputExecutionData* ccv_data)
 {
     static const CScriptWitness emptyWitness;
     if (witness == nullptr) {
@@ -2376,7 +2570,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                 // The scriptSig must be _exactly_ CScript(), otherwise we reintroduce malleability.
                 return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED);
             }
-            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false)) {
+            if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/false, ccv_data)) {
                 return false;
             }
             // Bypass the cleanstack check at the end. The actual stack is obviously not clean
@@ -2421,7 +2615,7 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
                     // reintroduce malleability.
                     return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
                 }
-                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true)) {
+                if (!VerifyWitnessProgram(*witness, witnessversion, witnessprogram, flags, checker, serror, /*is_p2sh=*/true, ccv_data)) {
                     return false;
                 }
                 // Bypass the cleanstack check at the end. The actual stack is obviously not clean

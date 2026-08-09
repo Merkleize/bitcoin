@@ -236,12 +236,53 @@ enum class KeyVersion
     ANYPREVOUT = 1,  //!< 1 or 33 byte public key, first byte is 0x01
 };
 
+/** An input-local amount constraint produced by OP_CHECKCONTRACTVERIFY. */
+struct CcvAmountConstraint
+{
+    enum class Type {
+        AGGREGATE,
+        EXCLUSIVE,
+    };
+
+    Type m_type;
+    size_t m_output_index;
+    CAmount m_amount;
+
+    static CcvAmountConstraint Aggregate(size_t output_index, CAmount amount)
+    {
+        return {Type::AGGREGATE, output_index, amount};
+    }
+
+    static CcvAmountConstraint Exclusive(size_t output_index)
+    {
+        return {Type::EXCLUSIVE, output_index, 0};
+    }
+};
+
+/** OP_CHECKCONTRACTVERIFY data produced while executing one input. */
+struct CcvInputExecutionData
+{
+    std::vector<CcvAmountConstraint> m_constraints;
+};
+
+/** OP_CHECKCONTRACTVERIFY data produced by every input of a transaction. */
+struct CcvTransactionExecutionData
+{
+    std::vector<CcvInputExecutionData> m_inputs;
+
+    explicit CcvTransactionExecutionData(size_t input_count) : m_inputs(input_count) {}
+};
+
 struct ScriptExecutionData
 {
     //! Whether m_tapleaf_hash is initialized.
     bool m_tapleaf_hash_init = false;
     //! The tapleaf hash.
     uint256 m_tapleaf_hash;
+    //! The taproot internal key.
+    std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+    //! The merkle root of the taproot tree.
+    std::optional<uint256> m_taproot_merkle_root = std::nullopt;
 
     //! Whether m_codeseparator_pos is initialized.
     bool m_codeseparator_pos_init = false;
@@ -263,8 +304,13 @@ struct ScriptExecutionData
     //! The hash of the corresponding output
     std::optional<uint256> m_output_hash;
 
-    //! The taproot internal key. */
-    std::optional<XOnlyPubKey> m_internal_key = std::nullopt;
+    //! Whether m_ccv_amount is initialized.
+    bool m_ccv_amount_init = false;
+    //! Residual amount of the current input according to CHECKCONTRACTVERIFY semantics.
+    CAmount m_ccv_amount;
+
+    //! Input-local result sink for OP_CHECKCONTRACTVERIFY amount constraints.
+    CcvInputExecutionData* m_ccv_data{nullptr};
 };
 
 /** Signature hash sizes */
@@ -340,6 +386,11 @@ public:
         return {};
     }
 
+    virtual bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& execdata, ScriptError* serror) const
+    {
+        return false;
+    }
+
     virtual ~BaseSignatureChecker() = default;
 };
 
@@ -379,6 +430,7 @@ public:
     bool CheckSequence(const CScriptNum& nSequence) const override;
     bool CheckDefaultCheckTemplateVerifyHash(const Span<const unsigned char>& hash) const override;
     uint256 GetTemplateHash(ScriptExecutionData& execdata) const override;
+    bool CheckContract(int mode, int index, const std::vector<unsigned char>& pubkey, const std::vector<unsigned char>& data, const std::vector<unsigned char>& taptree, ScriptExecutionData& ScriptExecutionData, ScriptError* serror) const override;
 };
 
 using TransactionSignatureChecker = GenericTransactionSignatureChecker<CTransaction>;
@@ -428,7 +480,10 @@ uint256 ComputeTaprootMerkleRoot(Span<const unsigned char> control, const uint25
 
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* error = nullptr);
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, script_verify_flags flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* error = nullptr);
-bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr);
+bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags, const BaseSignatureChecker& checker, ScriptError* serror = nullptr, CcvInputExecutionData* ccv_data = nullptr);
+
+/** Validate the transaction-wide amount constraints produced by OP_CHECKCONTRACTVERIFY. */
+std::optional<ScriptError> ValidateCcvTransaction(const CTransaction& tx, const CcvTransactionExecutionData& ccv_data);
 
 size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey, const CScriptWitness* witness, script_verify_flags flags);
 

@@ -148,6 +148,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
+                       CcvTransactionExecutionData& ccv_data,
                        std::vector<CScriptCheck>* pvChecks = nullptr,
                        bool is_consensus = false)
                        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -434,8 +435,10 @@ static bool CheckInputsFromMempoolAndCache(const CTransaction& tx, TxValidationS
         }
     }
 
+    CcvTransactionExecutionData ccv_data{tx.vin.size()};
+
     // Call CheckInputScripts() to cache signature and script validity against current tip consensus rules.
-    return CheckInputScripts(tx, state, view, flags, /*cacheSigStore=*/ true, /*cacheFullScriptStore=*/ true, txdata, validation_cache, /*pvChecks=*/nullptr, /*is_consensus=*/true);
+    return CheckInputScripts(tx, state, view, flags, /*cacheSigStore=*/ true, /*cacheFullScriptStore=*/ true, txdata, validation_cache, ccv_data, /*pvChecks=*/nullptr, /*is_consensus=*/true);
 }
 
 namespace {
@@ -1257,7 +1260,8 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), /*pvChecks=*/nullptr, /*is_consensus=*/false)) {
+    CcvTransactionExecutionData ccv_data{tx.vin.size()};
+    if (!CheckInputScripts(tx, state, m_view, scriptVerifyFlags, true, false, ws.m_precomputed_txdata, GetValidationCache(), ccv_data, /*pvChecks=*/nullptr, /*is_consensus=*/false)) {
         // Detect a failure due to a missing witness so that p2p code can handle rejection caching appropriately.
         if (!tx.HasWitness() && SpendsNonAnchorWitnessProg(tx, m_view)) {
             state.Invalid(TxValidationResult::TX_WITNESS_STRIPPED,
@@ -2134,7 +2138,7 @@ std::optional<std::pair<ScriptError, std::string>> CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
     ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
-    if (VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, m_flags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *m_signature_cache, *txdata), &error)) {
+    if (VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, m_flags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *m_signature_cache, *txdata), &error, m_ccv_execdata)) {
         return std::nullopt;
     } else {
         auto debug_str = strprintf("input %i of %s (wtxid %s), spending %s:%i", nIn, ptxTo->GetHash().ToString(), ptxTo->GetWitnessHash().ToString(), ptxTo->vin[nIn].prevout.hash.ToString(), ptxTo->vin[nIn].prevout.n);
@@ -2181,12 +2185,18 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, script_verify_flags flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
+                       CcvTransactionExecutionData& ccv_data,
                        std::vector<CScriptCheck>* pvChecks,
                        bool is_consensus)
 {
     if ((flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) == 0) is_consensus = true;
 
     if (tx.IsCoinBase()) return true;
+
+    assert(ccv_data.m_inputs.size() == tx.vin.size());
+    for (auto& input_data : ccv_data.m_inputs) {
+        input_data.m_constraints.clear();
+    }
 
     if (pvChecks) {
         pvChecks->reserve(tx.vin.size());
@@ -2228,7 +2238,7 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         // spent being checked as a part of CScriptCheck.
 
         // Verify signature
-        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata);
+        CScriptCheck check(txdata.m_spent_outputs[i], tx, validation_cache.m_signature_cache, i, flags, cacheSigStore, &txdata, &ccv_data.m_inputs[i]);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (auto result = check(); result.has_value()) {
@@ -2242,6 +2252,17 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                 return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(result->first)), result->second);
             } else {
                 return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("mempool-script-verify-flag-failed (%s)", ScriptErrorString(result->first)), result->second);
+            }
+        }
+    }
+
+    if (!pvChecks) {
+        if (const auto error{ValidateCcvTransaction(tx, ccv_data)}) {
+            const std::string debug_str{strprintf("transaction-wide OP_CHECKCONTRACTVERIFY checks for %s (wtxid %s)", tx.GetHash().ToString(), tx.GetWitnessHash().ToString())};
+            if (is_consensus) {
+                return state.Invalid(TxValidationResult::TX_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(*error)), debug_str);
+            } else {
+                return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("mempool-script-verify-flag-failed (%s)", ScriptErrorString(*error)), debug_str);
             }
         }
     }
@@ -2614,6 +2635,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // doesn't invalidate pointers into the vector, and keep txsdata in scope
     // for as long as `control`.
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
+    std::vector<std::unique_ptr<CcvTransactionExecutionData>> txs_ccv_data(block.vtx.size());
     CCheckQueueControl<CScriptCheck> control(fScriptChecks && parallel_script_checks ? &m_chainman.GetCheckQueue() : nullptr);
 
     const bool enforce_bip54{DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_CONSENSUSCLEANUP)};
@@ -2677,7 +2699,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             std::vector<CScriptCheck> vChecks;
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             TxValidationState tx_state;
-            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, parallel_script_checks ? &vChecks : nullptr, /*is_consensus=*/true)) {
+            if (fScriptChecks) {
+                txs_ccv_data[i] = std::make_unique<CcvTransactionExecutionData>(tx.vin.size());
+            }
+            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], m_chainman.m_validation_cache, *txs_ccv_data[i], parallel_script_checks ? &vChecks : nullptr, /*is_consensus=*/true)) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
@@ -2709,6 +2734,17 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     auto parallel_result = control.Complete();
     if (parallel_result.has_value() && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(parallel_result->first)), parallel_result->second);
+    }
+    if (!parallel_result.has_value() && state.IsValid() && fScriptChecks && parallel_script_checks) {
+        for (size_t i = 0; i < block.vtx.size(); ++i) {
+            if (!txs_ccv_data[i]) continue;
+            if (const auto error{ValidateCcvTransaction(*block.vtx[i], *txs_ccv_data[i])}) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                              strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(*error)),
+                              strprintf("transaction-wide OP_CHECKCONTRACTVERIFY checks for %s (wtxid %s)", block.vtx[i]->GetHash().ToString(), block.vtx[i]->GetWitnessHash().ToString()));
+                break;
+            }
+        }
     }
     if (!state.IsValid()) {
         LogInfo("Block validation error: %s", state.ToString());
